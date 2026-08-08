@@ -77,16 +77,23 @@ pub(super) fn decode_logprobs<T: Tokenizer + ?Sized>(
 /// The returned payload stores the first prompt token separately and decodes
 /// the remaining scored prompt positions into `scored_positions`, matching
 /// vLLM's prompt-logprobs semantics.
+///
+/// Prompt logprobs require at least one prompt token. Requests with empty
+/// prompts are rejected upstream at request-prepare time, so an empty
+/// `prompt_token_ids` here means the engine contract was violated; surface it
+/// as an error instead of panicking, since the workspace builds with
+/// `panic = "abort"` and a panic would take down the whole process.
 pub(super) fn decode_prompt_logprobs<T: Tokenizer + ?Sized>(
     tokenizer: &T,
+    request_id: &str,
     prompt_token_ids: &[u32],
     logprobs: &Logprobs,
     skip_special_tokens: bool,
 ) -> Result<DecodedPromptLogprobs, Error> {
-    let first_token_id = prompt_token_ids
-        .first()
-        .copied()
-        .expect("prompt logprobs require at least one prompt token");
+    let first_token_id =
+        prompt_token_ids.first().copied().ok_or_else(|| Error::EmptyPromptTokenIds {
+            request_id: request_id.to_owned(),
+        })?;
     let first_token = tokenizer.decode(&[first_token_id], skip_special_tokens)?;
     let scored_positions = logprobs
         .positions
@@ -193,8 +200,14 @@ mod tests {
         };
 
         assert_eq!(
-            decode_prompt_logprobs(&tokenizer, &[b'p' as u32, b'x' as u32], &logprobs, false)
-                .unwrap(),
+            decode_prompt_logprobs(
+                &tokenizer,
+                "req-test",
+                &[b'p' as u32, b'x' as u32],
+                &logprobs,
+                false
+            )
+            .unwrap(),
             DecodedPromptLogprobs {
                 first_token_id: b'p' as u32,
                 first_token: "p".to_string(),
@@ -208,5 +221,22 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn decode_prompt_logprobs_rejects_empty_prompt_instead_of_panicking() {
+        // A zero-token prompt cannot satisfy prompt-logprobs semantics (there
+        // is no first token to report). The workspace builds with
+        // `panic = "abort"`, so this must surface as an `Err`, not a panic:
+        // a panic here aborts the whole server process.
+        let tokenizer = TestTokenizer::new();
+        let logprobs = Logprobs { positions: vec![] };
+
+        let result = decode_prompt_logprobs(&tokenizer, "req-empty", &[], &logprobs, false);
+
+        assert!(matches!(
+            result,
+            Err(Error::EmptyPromptTokenIds { request_id }) if request_id == "req-empty"
+        ));
     }
 }
